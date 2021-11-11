@@ -1,0 +1,138 @@
+#
+# Copyright Amazon.com, Inc. and its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT
+#
+# Licensed under the MIT License. See the LICENSE accompanying this file
+# for the specific language governing permissions and limitations under
+# the License.
+#
+
+resource "aws_cloudfront_origin_access_identity" "preprod_origin_access_identity" {
+  provider = aws.preprod
+  comment  = "waf poc"
+}
+
+#virginia for Cfront protected resources
+resource "aws_cloudfront_distribution" "preprod" {
+  provider            = aws.preprod
+  default_root_object = var.default_root_object
+  enabled             = true
+  is_ipv6_enabled     = var.is_ipv6_enabled
+  price_class         = var.price_class
+  retain_on_delete    = var.retain_on_delete
+  wait_for_deployment = var.wait_for_deployment
+  #web_acl_id          = var.web_acl_id
+
+  /*   dynamic "logging_config" {
+    for_each = length(keys(var.logging_config)) == 0 ? [] : [var.logging_config]
+
+    content {
+      bucket          = logging_config.value["bucket"]
+      prefix          = lookup(logging_config.value, "prefix", null)
+      include_cookies = lookup(logging_config.value, "include_cookies", null)
+    }
+  } */
+
+  origin {
+    domain_name = aws_s3_bucket.preprod_web.bucket_regional_domain_name
+    origin_id   = "primaryS3"
+    #origin_path = lookup(origin.value, "origin_path", "")
+
+    s3_origin_config {
+      origin_access_identity = aws_cloudfront_origin_access_identity.preprod_origin_access_identity.cloudfront_access_identity_path
+    }
+
+    /*       dynamic "custom_origin_config" {
+        for_each = length(lookup(origin.value, "custom_origin_config", "")) == 0 ? [] : [lookup(origin.value, "custom_origin_config", "")]
+        content {
+          http_port                = custom_origin_config.value.http_port
+          https_port               = custom_origin_config.value.https_port
+          origin_protocol_policy   = custom_origin_config.value.origin_protocol_policy
+          origin_ssl_protocols     = custom_origin_config.value.origin_ssl_protocols
+          origin_keepalive_timeout = lookup(custom_origin_config.value, "origin_keepalive_timeout", null)
+          origin_read_timeout      = lookup(custom_origin_config.value, "origin_read_timeout", null)
+        }
+      } */
+
+    /*       dynamic "custom_header" {
+        for_each = lookup(origin.value, "custom_header", [])
+        content {
+          name  = custom_header.value.name
+          value = custom_header.value.value
+        }
+      } */
+
+  }
+
+
+  default_cache_behavior {
+    target_origin_id       = "primaryS3"
+    viewer_protocol_policy = "allow-all"
+
+    allowed_methods = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    cached_methods  = ["GET", "HEAD"]
+    #compress                  = true
+    #field_level_encryption_id = lookup(i.value, "field_level_encryption_id", null)
+    min_ttl     = 0
+    default_ttl = 3600
+    max_ttl     = 86400
+
+    forwarded_values {
+      query_string = false
+
+      cookies {
+        forward = "none"
+      }
+    }
+
+  }
+
+  ordered_cache_behavior {
+    path_pattern     = "/content/immutable/*"
+    allowed_methods  = ["GET", "HEAD", "OPTIONS"]
+    cached_methods   = ["GET", "HEAD", "OPTIONS"]
+    target_origin_id = "primaryS3"
+
+    forwarded_values {
+      query_string = false
+      headers      = ["Origin"]
+
+      cookies {
+        forward = "none"
+      }
+    }
+
+    min_ttl                = 0
+    default_ttl            = 86400
+    max_ttl                = 31536000
+    compress               = true
+    viewer_protocol_policy = "redirect-to-https"
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  tags = merge(
+    {
+      "Name" = format("%s", "CloudFront ${var.environment}")
+    },
+    {
+      "Environment" = format("%s", var.environment)
+    },
+    local.cfront_tags,
+    local.common_tags,
+  )
+
+  lifecycle {
+    ignore_changes = [
+      web_acl_id,
+    ]
+  }
+}

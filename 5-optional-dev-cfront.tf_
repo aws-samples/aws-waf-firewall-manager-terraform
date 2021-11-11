@@ -1,0 +1,107 @@
+#
+# Copyright Amazon.com, Inc. and its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT
+#
+# Licensed under the MIT License. See the LICENSE accompanying this file
+# for the specific language governing permissions and limitations under
+# the License.
+#
+
+resource "aws_cloudfront_origin_access_identity" "dev_origin_access_identity" {
+  provider = aws.dev
+  comment  = "waf poc"
+}
+
+resource "aws_cloudfront_distribution" "dev" {
+  provider = aws.dev
+  #default_root_object = var.default_root_object
+  enabled             = true
+  is_ipv6_enabled     = var.is_ipv6_enabled
+  price_class         = "PriceClass_All"
+  retain_on_delete    = var.retain_on_delete
+  wait_for_deployment = var.wait_for_deployment
+  #web_acl_id          = var.web_acl_id
+
+  /*   dynamic "logging_config" {
+    for_each = length(keys(var.logging_config)) == 0 ? [] : [var.logging_config]
+
+    content {
+      bucket          = logging_config.value["bucket"]
+      prefix          = lookup(logging_config.value, "prefix", null)
+      include_cookies = lookup(logging_config.value, "include_cookies", null)
+    }
+  } */
+
+  origin {
+    domain_name = "${aws_api_gateway_rest_api.apigw.id}.execute-api.eu-west-1.amazonaws.com"
+    origin_id   = "apigw"
+    origin_path = "/dev"
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "https-only"
+      origin_ssl_protocols   = ["TLSv1", "TLSv1.1"]
+    }
+
+    /*       dynamic "custom_header" {
+        for_each = lookup(origin.value, "custom_header", [])
+        content {
+          name  = custom_header.value.name
+          value = custom_header.value.value
+        }
+      } */
+
+  }
+
+
+  default_cache_behavior {
+    target_origin_id       = "apigw"
+    viewer_protocol_policy = "https-only"
+
+    allowed_methods = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    cached_methods  = ["GET", "HEAD", "OPTIONS"]
+    compress        = true
+    #field_level_encryption_id = lookup(i.value, "field_level_encryption_id", null)
+    min_ttl     = 0
+    default_ttl = 3600
+    max_ttl     = 86400
+
+    forwarded_values {
+      query_string = true
+      headers      = ["Accept", "Referer", "Authorization", "Content-Type"]
+      cookies {
+        forward = "all"
+      }
+    }
+
+  }
+
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  tags = merge(
+    {
+      "Name" = format("%s", "CloudFront ${var.environment}")
+    },
+    {
+      "Environment" = format("%s", var.environment)
+    },
+    local.cfront_tags,
+    local.common_tags,
+  )
+
+  lifecycle {
+    ignore_changes = [
+      web_acl_id,
+    ]
+  }
+}

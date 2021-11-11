@@ -1,0 +1,47 @@
+#
+# Copyright Amazon.com, Inc. and its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT
+#
+# Licensed under the MIT License. See the LICENSE accompanying this file
+# for the specific language governing permissions and limitations under
+# the License.
+#
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Kinesis deployment for AWS WAF Dashboard build 
+
+Parameters:
+  DestinationS3bucketARN:
+    Type: String
+    Description: ARN of the destinatio S3 bucket 
+  
+  KinesisDeliveryRoleARN:
+    Type: String
+    Description: ARN of iam role for kinesis
+
+
+Resources:
+  KinesisFirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties: 
+      DeliveryStreamName: !Sub aws-waf-logs-${AWS::StackName}-delivery
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Ref DestinationS3bucketARN
+        RoleARN: !Ref KinesisDeliveryRoleARN
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+        Prefix: waf-logs
+        #EncryptionConfiguration:
+        #CloudWatchLoggingOptions:
+        #  Enabled:
+        #  LogGroupName:
+        #  LogStreamName:
+
+
+Outputs:
+
+  KinesisFirehoseDeliveryStreamArn:
+    Description: kenesis Firehose
+    Value: !GetAtt KinesisFirehoseDeliveryStream.Arn

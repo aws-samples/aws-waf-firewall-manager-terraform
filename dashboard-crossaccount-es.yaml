@@ -1,0 +1,897 @@
+#
+# Copyright Amazon.com, Inc. and its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT
+#
+# Licensed under the MIT License. See the LICENSE accompanying this file
+# for the specific language governing permissions and limitations under
+# the License.
+#
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Sample AWS WAF Dashboard build on Amazon Elasticsearch Service.
+
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+
+  Subnet1:
+    Type: AWS::EC2::Subnet::Id
+
+  Subnet2:
+    Type: AWS::EC2::Subnet::Id
+  
+  S3BucketName:
+    Type: String
+    Description: Name of S3 bucket
+
+  DataNodeEBSVolumeSize:
+    Type: Number
+    Default: 100
+    Description: Elasticsearch volume disk size
+
+  NodeType:
+    Type: String
+    Default: m5.large.elasticsearch
+    Description: Elasticsearch Node Type
+
+  ElasticSerchDomainName:
+    Type: String
+    Default: 'waf-dashboards'
+    AllowedPattern: "[a-z\\-]*"
+    Description: Elasticsearch domain name
+  
+  KinesisDeliveryRoleARN:
+    Type: String
+    Description: ARN of iam role for kinesis
+
+  UserEmail:
+    Type: String
+    Default: 'your@email.com'
+    Description: Dashboard user e-mail address
+  
+  ESConfigBucket:
+    Type: String
+    AllowedPattern: ^[A-Za-z0-9][A-Za-z0-9\-_]{3,62}$
+    Description: ElasticSearch configuration lambda code bucket
+
+Resources:
+
+  #For production, encryption has to be added if the S3 bucket is not already created
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt LogEnrichmentLambda.Arn
+    DeletionPolicy: Retain
+
+  #Dependency with KinesisDeliveryRoleARN, created in another account before this CF stack is deployed
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      PolicyDocument:
+        Id: MyPolicy
+        Version: 2012-10-17
+        Statement:
+          - Sid: PublicReadForGetBucketObjects
+            Effect: Allow
+            Principal: 
+              AWS: 
+                - !Ref KinesisDeliveryRoleARN
+            Action: 
+              - s3:AbortMultipartUpload
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:ListBucketMultipartUploads
+              - s3:PutObject
+              - s3:PutObjectAcl
+            Resource: 
+              - !Sub arn:aws:s3:::${S3Bucket}
+              - !Sub arn:aws:s3:::${S3Bucket}/*
+      Bucket: !Ref S3Bucket  
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-user-pool
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+
+  UserPoolDomain: 
+    Type: AWS::Cognito::UserPoolDomain 
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub ${AWS::StackName}-user-pool-domain
+    
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${AWS::StackName}-user-pool-client
+      GenerateSecret: false
+      UserPoolId: !Ref UserPool
+
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: "WAFKibanaIdentityPool"
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders: 
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+  
+  UserPoolUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties: 
+      DesiredDeliveryMediums: 
+        - EMAIL
+      UserAttributes: 
+        - Name: email
+          Value: !Ref UserEmail
+      Username: !Ref UserEmail
+      UserPoolId: !Ref UserPool
+
+  CognitoAuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: "sts:AssumeRoleWithWebIdentity"
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              ForAnyValue:StringLike:
+                "cognito-identity.amazonaws.com:amr": authenticated
+      Policies:
+        - PolicyName: CognitoAuthorizedPolicy
+          PolicyDocument: 
+            Version: 2012-10-17
+            Statement: 
+              - Effect: Allow
+                Action: es:ESHttp*
+                Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticSerchDomainName}/*
+
+  IdentityPoolRoleMapping:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt CognitoAuthenticatedRole.Arn
+  
+  ElasticsearchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group with no ingress rule"
+      VpcId: !Ref VPC
+      
+  ElasticsearchSGBaseIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ElasticsearchSecurityGroup
+      IpProtocol: tcp
+      FromPort: '443'
+      ToPort:  '443'
+      SourceSecurityGroupId: !Ref ElasticsearchSecurityGroup
+
+  ElasticsearchSGBaseIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ElasticsearchSecurityGroup
+      IpProtocol: tcp
+      FromPort: '80'
+      ToPort:  '80'
+      SourceSecurityGroupId: !Ref ElasticsearchSecurityGroup
+
+  #this is for accessing Kibana from outside a VPC with a bastion hots - delete
+  ElasticsearchSGBaseIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      CidrIp: "10.2.1.0/24"
+      IpProtocol: tcp
+      FromPort: '443'
+      ToPort:  '443'
+      GroupId: !Ref ElasticsearchSecurityGroup
+
+  #this is for accessing Kibana from outside a VPC with a bastion hots - delete
+  ElasticsearchSGBaseIngress4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      CidrIp: "10.2.1.0/24"
+      IpProtocol: tcp
+      FromPort: '80'
+      ToPort:  '80'
+      GroupId: !Ref ElasticsearchSecurityGroup
+
+  ESServiceLinkedRole:
+    Type: 'AWS::IAM::ServiceLinkedRole'
+    Properties:
+      AWSServiceName: es.amazonaws.com
+      Description: 'Role for ES to access resources in my VPC'
+
+  #overpermissive, change for prod
+  LogEnrichmentLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: 2012-10-17
+      Policies:
+          - PolicyName: ElasticAccessLogPolicy
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action: 'es:*'
+                  Resource: '*'
+                - Effect: Allow
+                  Action: 'ec2:*NetworkInterface*'
+                  Resource: '*'
+                - Effect: Allow
+                  Action:
+                    - 's3:GetBucketNotification'
+                    - 's3:PutBucketNotification'
+                  Resource: !Sub 'arn:aws:s3:::${S3BucketName}'
+                - Effect: Allow
+                  Action:
+                    - 'logs:CreateLogGroup'
+                    - 'logs:CreateLogStream'
+                    - 'logs:PutLogEvents'
+                  Resource: '*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  #for prod, index should be a parameter instead of being hardcoded
+  LogEnrichmentLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-log-enrichment
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Runtime: python3.7
+      Timeout: 300
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref ElasticsearchSecurityGroup
+        SubnetIds:
+          - !Ref Subnet1
+          - !Ref Subnet2
+      Environment:
+        Variables:
+          DOMAINNAME: !GetAtt ElasticsearchDomain.DomainEndpoint
+          index: waf-logs
+      Role: !GetAtt LogEnrichmentLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import base64
+          import json
+          import pyasn
+          from user_agents import parse
+          from counter_robots import is_machine, is_robot
+          import boto3
+          import os
+          import re
+          import requests
+          from requests_aws4auth import AWS4Auth
+
+          print('Loading AWS WAF Logs Enrichment function')
+          asndb = pyasn.pyasn('/opt/ipasn.dat')
+          ua = {}
+          s3 = boto3.client('s3')
+
+
+          def getUAInfo(user_agent_string):
+              if user_agent_string in ua:
+                  return ua[user_agent_string]
+              else:
+                  info = {}
+                  user_agent = parse(user_agent_string)
+                  browser = {}
+                  browser['family'] = user_agent.browser.family
+                  browser['version'] = user_agent.browser.version_string
+                  info['browser'] = browser
+                  os = {}
+                  os['family'] = user_agent.os.family
+                  os['version'] = user_agent.os.version_string
+                  info['os'] = os
+                  device = {}
+                  device['family'] = user_agent.device.family
+                  device['brand'] = user_agent.device.brand
+                  device['model'] = user_agent.device.model
+                  info['device'] = device
+                  ua[user_agent_string] = info
+                  return info
+
+          def enrich(payload):
+              #output = []
+              #payload = base64.b64decode(record['data'])
+              log = json.loads(payload)
+              # Flattens the header fields
+              flatheaders = {}
+              for item in log['httpRequest']['headers']:
+                  flatheaders[item['name'].lower()] = item['value']
+              del(log['httpRequest']['headers'])
+              log['httpRequest']['headers'] = flatheaders
+              # Parse and add webacl information
+              webacl_info = log['webaclId'].split(":")
+              log['webaclRegion'] = webacl_info[3]
+              log['webaclAccount'] = webacl_info[4]
+              webacl_name = webacl_info[5].split("/")
+              log['webaclName'] = webacl_name[2]
+
+              # Adds  ASN number
+              ip = ""
+              if 'x-forwarded-for' in log['httpRequest']['headers']:
+                  ip = log['httpRequest']['headers']['x-forwarded-for']
+                  # XFF header may come with more than one IP address, we'll use the first appearance in the list to report the ASN
+                  if len(ip) > 15:
+                      print(f'[WARNING] XFF with multiple IP addresses: {ip}; considering last')
+                      ip = ip.split(', ')[-1]
+              else:
+                  ip = log['httpRequest']['clientIp']
+              try:
+                  log['httpRequest']['asn'] = asndb.lookup(ip)[0]
+              except Exception as e:
+                  log['httpRequest']['asn'] = 'unknown'
+                  print(f'[ERROR] Got error {e}, while processing ASN for IP {ip}')
+                  print(e)
+              if 'user-agent' in log['httpRequest']['headers']:
+                  user_agent_string = log['httpRequest']['headers']['user-agent']
+                  # Adds user-agent information
+                  ua_info = getUAInfo(user_agent_string)
+                  log['httpRequest']['browser'] = ua_info['browser']
+                  log['httpRequest']['os'] = ua_info['os']
+                  log['httpRequest']['device'] = ua_info['device']
+                  # Adds robot information
+                  device_type = ''
+                  if is_machine(user_agent_string):
+                      device_type = 'machine'
+                  elif is_robot(user_agent_string):
+                      device_type = 'robot'
+                  else:
+                      device_type = 'other'
+                  log['httpRequest']['deviceType'] = device_type
+              #payload_output = json.dumps(log)
+              #output_record = {
+              #    'recordId': record['recordId'],
+              #    'result': 'Ok',
+              #    'data': base64.b64encode(payload.encode('utf-8') + b'\n').decode('utf-8')
+              #}
+              #output.append(output_record)
+              print("Successfully processed record")
+              return log
+
+          def lambda_handler(event, context):
+              print(event)
+              index = os.environ['index'] + "-" +  (event['Records'][0]['eventTime'].split("T"))[0]
+              region = event['Records'][0]['awsRegion']
+              print(region)
+              service = 'es'
+              credentials = boto3.Session().get_credentials()
+              awsauth = AWS4Auth(credentials.access_key, credentials.secret_key, region, service, session_token=credentials.token)
+              headers = { "Content-Type": "application/json" }
+              endpoint_name=os.environ['DOMAINNAME']
+              type = '_doc'
+              url = "https://" + endpoint_name + '/' + index + '/' + type
+              print(url)
+
+
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  try:
+                      obj = s3.get_object(Bucket=bucket, Key=key)
+                      body = obj['Body'].read()
+                      lines = body.splitlines()
+                      print(body)
+                      
+                      for line in lines:
+                          
+                          line = line.decode("utf-8")
+                          print(line)
+                          enrich_line = enrich(line)
+                          print(enrich_line)
+                          r = requests.post(url, auth=awsauth, json=enrich_line, headers=headers)
+                          print(r)
+                      
+
+                      
+                  except Exception as e:
+                      print(e)
+                      print('Error getting object {} from bucket {}. Make sure they exist and your bucket is in the same region as this function.'.format(key, bucket))
+                      raise e
+
+  
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LogEnrichmentLambda.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:aws:s3:::${S3BucketName}'
+
+  CustomLambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketNotification'
+                  - 's3:PutBucketNotification'
+                Resource: !Sub 'arn:aws:s3:::${S3BucketName}'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'es:*'
+                Resource: 'arn:aws:es:*:*:*'
+
+
+  CustomResourceLambdaFunction:
+    DependsOn: S3Bucket
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CustomLambdaIAMRole.Arn
+      Code:
+        ZipFile: |
+
+            from __future__ import print_function
+            import json
+            import boto3
+            import cfnresponse
+            
+            SUCCESS = "SUCCESS"
+            FAILED = "FAILED"
+            
+            print('Loading function')
+            s3 = boto3.resource('s3')
+            
+            def lambda_handler(event, context):
+                print("Received event: " + json.dumps(event, indent=2))
+                responseData={}
+                try:
+                    if event['RequestType'] == 'Delete':
+                        print("Request Type:",event['RequestType'])
+                        Bucket=event['ResourceProperties']['Bucket']
+                        delete_notification(Bucket)
+                        print("Sending response to custom resource after Delete")
+                    elif event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                        print("Request Type:",event['RequestType'])
+                        LambdaArn=event['ResourceProperties']['LambdaArn']
+                        Bucket=event['ResourceProperties']['Bucket']
+                        add_notification(LambdaArn, Bucket)
+                        responseData={'Bucket':Bucket}
+                        print("Sending response to custom resource")
+                    responseStatus = 'SUCCESS'
+                except Exception as e:
+                    print('Failed to process:', e)
+                    responseStatus = 'FAILURE'
+                    responseData = {'Failure': 'Something bad happened.'}
+                cfnresponse.send(event, context, responseStatus, responseData)
+
+            def add_notification(LambdaArn, Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                  NotificationConfiguration={
+                    'LambdaFunctionConfigurations': [
+                      {
+                          'LambdaFunctionArn': LambdaArn,
+                          'Events': [
+                              's3:ObjectCreated:*'
+                          ]
+                      }
+                    ]
+                  }
+                )
+                print("Put request completed....")
+              
+            def delete_notification(Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                    NotificationConfiguration={}
+                )
+                print("Delete request completed....")
+      Runtime: python3.6
+      Timeout: 50
+
+  #dependency with S3 bucket, it has to be already created
+  LambdaTrigger:
+    Type: 'Custom::LambdaTrigger'
+    DependsOn: LambdaInvokePermission
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      LambdaArn: !GetAtt LogEnrichmentLambda.Arn
+      Bucket: !Ref S3BucketName
+
+  CodebuildRole:
+    DependsOn: LogEnrichmentLambda
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:GetLayerVersion
+                  - lambda:PublishLayerVersion
+                Resource: "*"
+              - Effect: Allow
+                Action: lambda:UpdateFunctionConfiguration
+                Resource: !GetAtt LogEnrichmentLambda.Arn
+
+  #Lambda is in VPC, libraries added to the lambda layer
+  LayerCodebuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Description: !Sub "${AWS::StackName} Lambda Layer build"
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+        - Name: LAMBDA_FUNCTION_NAME
+          Type: PLAINTEXT
+          Value: !Sub ${AWS::StackName}-log-enrichment
+        - Name: LAMBDA_LAYER_NAME
+          Type: PLAINTEXT
+          Value: !Sub ${AWS::StackName}-log-enrichment-layer
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+      Name: !Sub "${AWS::StackName}-lambda-layer-build"
+      ServiceRole: !Ref CodebuildRole
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - echo "Install Step"
+                #- yum update -y
+                - yum install -y gcc python3.7 python3-devel python3-pip python-virtualenv zip
+            pre_build:
+              commands:
+                - echo "Pre-build Step"
+                - PYTHON_PATH=build/python/lib/python3.7/site-packages
+                - virtualenv -p python3.7 venv
+            build:
+              commands:
+                - echo "Build Step"
+                - . venv/bin/activate
+                - $VIRTUAL_ENV/bin/pip3 install -U --target $VIRTUAL_ENV/lib/python3.7/site-packages pyasn
+                - $VIRTUAL_ENV/bin/pip3 install -U boto3
+                - $VIRTUAL_ENV/bin/pip3 install -U requests
+                - $VIRTUAL_ENV/bin/pip3 install -U requests-aws4auth
+                - $VIRTUAL_ENV/bin/pip3 install -U user_agents
+                - $VIRTUAL_ENV/bin/pip3 install -U counter_robots
+                - $VIRTUAL_ENV/lib/python3.7/site-packages/bin/pyasn_util_download.py --latest
+                - RIB_FILE=`ls rib.*`
+                - $VIRTUAL_ENV/lib/python3.7/site-packages/bin/pyasn_util_convert.py --single $RIB_FILE ipasn.dat
+                - mkdir -p ./$PYTHON_PATH
+                - cp -a $VIRTUAL_ENV/lib/python3.7/site-packages/. ./$PYTHON_PATH
+                - rm -rf ./$PYTHON_PATH/wheel*
+                - rm -rf ./$PYTHON_PATH/easy-install*
+                - rm -rf ./$PYTHON_PATH/setuptools*
+                - rm -rf ./$PYTHON_PATH/virtualenv*
+                - rm -rf ./$PYTHON_PATH/pip*
+                - rm -rf ./$PYTHON_PATH/_virtualenv*
+                - rm -rf ./$PYTHON_PATH/bin/*
+                - mv ipasn.dat ./build
+                - cd ./build
+                - zip -r layer.zip .
+            post_build:
+              commands:
+                - LAMBDA_LAYER_VERSION=`aws lambda publish-layer-version --layer-name $LAMBDA_LAYER_NAME --description "AWS WAF Logs Enrichment Tools and Database" --zip-file fileb://layer.zip --compatible-runtimes python3.7 --query 'LayerVersionArn' --output text`
+                - aws lambda update-function-configuration --function-name $LAMBDA_FUNCTION_NAME --layers $LAMBDA_LAYER_VERSION
+      TimeoutInMinutes: 15
+
+  BuildEventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+        Version: 2012-10-17
+      Policies:
+      - PolicyName: CodeBuildProjectStartBuild
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: codebuild:StartBuild
+            Resource: !GetAtt LayerCodebuildProject.Arn
+
+  RebuildEnrichmentLayerTrigger:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: Rebuilds Lambda Layer for AWS WAF Log Enrichment
+      Name: !Sub ${AWS::StackName}-layer-monthly-build
+      RoleArn: !GetAtt BuildEventBridgeRole.Arn
+      ScheduleExpression: cron(0 0 1 * ? *)
+      State: ENABLED
+      Targets: 
+        - Arn: !GetAtt LayerCodebuildProject.Arn
+          Id: !Sub ${AWS::StackName}-Codebuild-Project-Start-Build
+          RoleArn: !GetAtt BuildEventBridgeRole.Arn
+
+  ESCognitoRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: es.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonESCognitoAccess'
+      Path: /
+  
+  #encryption not added for poc
+  ElasticsearchDomain:
+    DependsOn: 
+      - ESServiceLinkedRole
+    Type: AWS::Elasticsearch::Domain
+    Properties:
+      DomainName: !Ref ElasticSerchDomainName
+      ElasticsearchVersion: 7.7
+      ElasticsearchClusterConfig:
+        InstanceCount: 1
+        InstanceType: !Ref NodeType
+      EncryptionAtRestOptions:
+        Enabled: true
+      DomainEndpointOptions: 
+        EnforceHTTPS: true
+      VPCOptions:
+        SubnetIds:
+          - !Ref Subnet1
+        SecurityGroupIds:
+          - !Ref ElasticsearchSecurityGroup
+      EBSOptions:
+        EBSEnabled: true
+        Iops: 0
+        VolumeSize: !Ref DataNodeEBSVolumeSize
+        VolumeType: 'gp2'
+      SnapshotOptions:
+        AutomatedSnapshotStartHour: '0'
+      CognitoOptions:
+        Enabled: true
+        IdentityPoolId: !Ref IdentityPool
+        UserPoolId: !Ref UserPool
+        RoleArn: !GetAtt ESCognitoRole.Arn
+      AccessPolicies:
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt LogEnrichmentLambdaRole.Arn
+            Action: es:ESHttp*
+            Resource: 
+              - !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticSerchDomainName}/*
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt ESConfigRole.Arn
+            Action: es:ESHttp*
+            Resource: 
+              - !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticSerchDomainName}/*
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt CognitoAuthenticatedRole.Arn
+            Action: es:ESHttp*
+            Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticSerchDomainName}/*
+
+  ESConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ESConfigPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: es:ESHttp*
+                Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticSerchDomainName}/*
+              - Effect: Allow
+                Action: "ec2:*NetworkInterface*"
+                Resource: "*"
+  
+  ESConfigFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-es-config-function
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.7
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref ElasticsearchSecurityGroup
+        SubnetIds:
+          - !Ref Subnet1
+          - !Ref Subnet2
+      Timeout: 30
+      Role: !GetAtt ESConfigRole.Arn
+      Code:
+        S3Bucket: !Ref ESConfigBucket
+        S3Key: esconfig.zip
+
+  ESConfiguration:
+    Type: Custom::WAFDashboards
+    Properties:
+      ServiceToken: !GetAtt ESConfigFunction.Arn
+      Host: !GetAtt ElasticsearchDomain.DomainEndpoint
+      Region: !Ref AWS::Region
+
+  WAFOperationsSetUpRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+        Version: 2012-10-17
+      Policies:
+        - PolicyName: WAFOperationsSetUpLambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: codebuild:StartBuild
+                Resource: !GetAtt LayerCodebuildProject.Arn
+              - Effect: Allow
+                Action: 
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${S3BucketName}
+                  - !Sub arn:aws:s3:::${S3BucketName}/*
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  WAFOperationsSetUpLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: 
+      - LayerCodebuildProject
+      - S3Bucket
+    Properties:
+      Code:
+        ZipFile:
+          !Sub |
+            import boto3
+            import cfnresponse
+            def lambda_handler(event, context):
+              print(event)
+              try:
+                if event['RequestType'] == 'Create':
+                  client = boto3.client(service_name='codebuild', region_name='${AWS::Region}')
+                  new_build = client.start_build(projectName='${AWS::StackName}-lambda-layer-build')
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+                if event['RequestType'] == 'Delete':
+                  s3 = boto3.resource('s3')
+                  bucket = s3.Bucket('${S3Bucket}')
+                  bucket.objects.all().delete()
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+                if event['RequestType'] == 'Update':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              except Exception as err:
+                cfnresponse.send(event, context, cfnresponse.FAILED, {})
+                return
+      FunctionName: !Sub ${AWS::StackName}-waf-operations-set-up
+      Handler: index.lambda_handler
+      Role: !GetAtt WAFOperationsSetUpRole.Arn
+      Runtime: python3.7
+      Timeout: 180
+
+  FirstInvokeWAFOperationsSetUpLambda:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: 
+      - WAFOperationsSetUpLambda
+      - S3Bucket
+    Version: "1.0"
+    Properties:
+      ServiceToken: !GetAtt WAFOperationsSetUpLambda.Arn
+
+Outputs:
+  UserPoolId:
+    Description: UserPool::Id
+    Value: !Ref UserPool
+    
+  UserPoolClientId:
+    Description: UserPoolClient::Id
+    Value: !Ref UserPoolClient
+    
+  IdentityPoolId:
+    Description: IdentityPool::Id  
+    Value: !Ref IdentityPool
+
+  ElasticSearchURL:
+    Description: ElasticSearch URL  
+    Value: !GetAtt ElasticsearchDomain.DomainEndpoint
+
+  DashboardLinkOutput:
+    Description: Link to WAF Dashboard
+    Value: !Join
+      - ''
+      - - 'https://'
+        - !GetAtt ElasticsearchDomain.DomainEndpoint
+        - '/_plugin/kibana/'
+
+  LogEnrichmentLambdaARN:
+    Description: Log enrichment lambda ARN
+    Value: !GetAtt LogEnrichmentLambda.Arn
+
+  S3bucketARN:
+    Description: S3 bucket ARN
+    Value: !GetAtt S3Bucket.Arn

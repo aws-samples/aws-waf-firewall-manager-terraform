@@ -1,0 +1,74 @@
+#
+# Copyright Amazon.com, Inc. and its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT
+#
+# Licensed under the MIT License. See the LICENSE accompanying this file
+# for the specific language governing permissions and limitations under
+# the License.
+#
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Kinesis deployment Role for AWS WAF Dashboard build 
+
+Parameters:
+  S3Bucket:
+    Type: String
+    Description: Name of the destinatio S3 bucket 
+
+
+Resources:
+
+  DeliveryStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: kinesis-delivery-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: firehose.amazonaws.com
+      Policies:
+        - PolicyName: DeliveryStreamRolePolicy
+          PolicyDocument: 
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - !Sub arn:aws:s3:::${S3Bucket}
+                  - !Sub arn:aws:s3:::${S3Bucket}/*
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource: !Sub arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/%FIREHOSE_STREAM_NAME%
+              #- Effect: Allow
+              #  Action:
+              #    - kms:Decrypt
+              #    - kms:GenerateDataKey
+              #  Resource: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}-id:key/key-id
+              #  Condition:
+              #    StringEquals:
+              #      "kms:ViaService": !Ref s3.region.amazonaws.com
+              #    StringLike:
+              #      "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::bucket-name/prefix*"
+
+Outputs:
+
+  KinesisFirehoseDeliveryRoleArn:
+    Description: kenesis Firehose
+    Value: !GetAtt DeliveryStreamRole.Arn

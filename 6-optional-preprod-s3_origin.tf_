@@ -1,0 +1,59 @@
+#
+# Copyright Amazon.com, Inc. and its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT
+#
+# Licensed under the MIT License. See the LICENSE accompanying this file
+# for the specific language governing permissions and limitations under
+# the License.
+#
+
+data "aws_iam_policy_document" "s3_policy" {
+  statement {
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.preprod_web.arn}/*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = [aws_cloudfront_origin_access_identity.preprod_origin_access_identity.iam_arn]
+    }
+  }
+}
+
+locals {
+  bucket_name = "waf-poc-11111"
+}
+
+resource "aws_s3_bucket_policy" "preprod_web" {
+  provider = aws.preprod
+  bucket   = aws_s3_bucket.preprod_web.id
+  policy   = data.aws_iam_policy_document.s3_policy.json
+}
+
+resource "aws_s3_bucket" "preprod_web" {
+  provider = aws.preprod
+  bucket   = local.bucket_name
+  acl      = "private"
+
+  tags = merge(
+    {
+      "Name" = format("%s", "Bucket for CloudFront ${var.environment}")
+    },
+    {
+      "Environment" = format("%s", var.environment)
+    },
+    local.common_tags,
+  )
+
+  versioning {
+    enabled = true
+  }
+
+  lifecycle_rule {
+    id      = "expire-old-versions"
+    enabled = true
+
+    noncurrent_version_expiration {
+      days = 7
+    }
+  }
+}

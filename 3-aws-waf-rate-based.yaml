@@ -1,0 +1,97 @@
+#
+# Copyright Amazon.com, Inc. and its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT
+#
+# Licensed under the MIT License. See the LICENSE accompanying this file
+# for the specific language governing permissions and limitations under
+# the License.
+#
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: template to create AWS WAF v2 Rule group with rate based rule
+
+Parameters:
+  HTTPGetFloodRateParam:
+    Description: "A Rate-Based Rule looking for a maximum rate of a single IP address can perform HTTP Get requests in 5 minutes"
+    Type: Number
+    Default: 10000
+    MinValue: 100
+    MaxValue: 20000000
+
+  HTTPPostLoginParam:
+    Description: "Enter the URI for a Login page to rate-limit IP addresses from login attemps. Leave this blank for universal HTTP Post rate-limit"
+    Type: String
+    Default: login
+
+Resources:
+  SampleRuleGroup:
+    Type: 'AWS::WAFv2::RuleGroup'
+    Properties:
+      Name: HTTP-FloodP-Protection
+      Scope: CLOUDFRONT
+      Description: HTTPFloodPProtection
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: SampleRateBasedRuleGroupMetrics
+      Capacity: 100
+      Rules:
+        - Name: HTTPFloodPProtection
+          Priority: 0
+          Action:
+            Block: {}
+          VisibilityConfig:
+              SampledRequestsEnabled: true
+              CloudWatchMetricsEnabled: true
+              MetricName: RateBasedGet
+          Statement:
+            RateBasedStatement:
+              AggregateKeyType: "IP"
+              Limit: !Ref HTTPGetFloodRateParam
+              ScopeDownStatement: 
+                ByteMatchStatement:
+                  FieldToMatch:
+                    Method: {}
+                  PositionalConstraint: EXACTLY
+                  SearchString: get
+                  TextTransformations:
+                    - Priority: 0
+                      Type: LOWERCASE
+        - Name: HTTPPostFloodPProtection
+          Priority: 1
+          Action:
+            Block: {}
+          VisibilityConfig:
+              SampledRequestsEnabled: true
+              CloudWatchMetricsEnabled: true
+              MetricName: RateBasedPost
+          Statement:
+            RateBasedStatement:
+              AggregateKeyType: "IP"
+              Limit: !Ref HTTPGetFloodRateParam
+              ScopeDownStatement: 
+                AndStatement:
+                  Statements:
+                  - ByteMatchStatement:
+                      FieldToMatch:
+                        UriPath: {}
+                      PositionalConstraint: CONTAINS
+                      SearchString: !Ref HTTPPostLoginParam 
+                      TextTransformations:
+                        - Priority: 0
+                          Type: LOWERCASE
+                        - Priority: 1
+                          Type: URL_DECODE
+                  - ByteMatchStatement:
+                      SearchString: post
+                      FieldToMatch:
+                        Method: {}
+                      TextTransformations:
+                      - Priority: 0
+                        Type: LOWERCASE
+                      PositionalConstraint: EXACTLY
+Outputs:
+  RuleGorupARN:
+    Description: RuleGroup Arn
+    Value: !GetAtt SampleRuleGroup.Arn
+    
